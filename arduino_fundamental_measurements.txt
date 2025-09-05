@@ -1,0 +1,498 @@
+// Fundamental Aerodynamic Measurements System
+// Provides raw measurements for manual calculation verification
+
+#include <OneWire.h>
+#include <DallasTemperature.h>
+
+// Pin definitions
+const int STATIC_PRESSURE_PIN = A0;      // Static pressure sensor
+const int TOTAL_PRESSURE_PIN = A1;       // Total pressure sensor (pitot tube)
+const int TEMPERATURE_PIN = 2;           // DS18B20 temperature sensor
+const int PROFILE_DRAG_PINS[] = {A2, A3, A4, A5};  // Profile drag measurement ports
+const int NUM_DRAG_PORTS = 4;
+
+// Temperature sensor setup
+OneWire oneWire(TEMPERATURE_PIN);
+DallasTemperature tempSensor(&oneWire);
+
+// Calibration constants for pressure sensors
+struct SensorCalibration {
+  float zero_voltage;        // Zero pressure voltage (V)
+  float full_scale_voltage;  // Full scale voltage (V)
+  float pressure_range;      // Pressure range (Pa)
+  String sensor_type;        // Sensor model/type for reference
+};
+
+// Sensor calibrations (adjust based on your specific sensors)
+SensorCalibration static_sensor = {
+  2.5,    // Zero at 2.5V (typical for ±range sensors)
+  5.0,    // Full scale voltage
+  2500.0, // ±2500 Pa range
+  "Honeywell_SSCDRRN002PGAA5"
+};
+
+SensorCalibration total_sensor = {
+  2.5,    // Zero at 2.5V
+  5.0,    // Full scale voltage  
+  2500.0, // ±2500 Pa range
+  "Honeywell_SSCDRRN002PGAA5"
+};
+
+SensorCalibration profile_sensor = {
+  2.5,    // Zero at 2.5V
+  5.0,    // Full scale voltage
+  1250.0, // ±1250 Pa range
+  "Honeywell_SSCDRRN001PGAA5"
+};
+
+// Measurement data structure
+struct RawMeasurements {
+  // Raw sensor readings
+  float static_voltage;           // V
+  float total_voltage;            // V
+  float profile_voltages[NUM_DRAG_PORTS];  // V
+  float temperature_celsius;      // °C
+  
+  // Converted pressure readings
+  float static_pressure;          // Pa (absolute)
+  float total_pressure;          // Pa (absolute)
+  float profile_pressures[NUM_DRAG_PORTS];  // Pa (gauge)
+  
+  // Fundamental calculations
+  float dynamic_pressure;         // Pa
+  float temperature_kelvin;       // K
+  float air_density;             // kg/m³
+  float air_viscosity;           // Pa·s
+  float velocity;                // m/s
+  float reynolds_number;         // dimensionless
+  float profile_drag_coefficient; // dimensionless
+  
+  // Environmental conditions
+  float atmospheric_pressure;     // Pa (standard: 101325)
+  float relative_humidity;        // % (assumed: 50%)
+  
+  unsigned long timestamp;        // ms
+};
+
+RawMeasurements current_data;
+
+// System configuration
+float characteristic_length = 0.1;  // m (chord length or diameter)
+float reference_area = 0.01;        // m² (frontal area for drag)
+float atmospheric_pressure = 101325.0; // Pa (sea level standard)
+float relative_humidity = 50.0;     // % (assumed)
+
+// Communication variables
+String inputString = "";
+bool stringComplete = false;
+bool continuous_output = false;
+int output_interval = 1000; // ms
+
+void setup() {
+  Serial.begin(115200);
+  
+  // Initialize temperature sensor
+  tempSensor.begin();
+  tempSensor.setResolution(12); // 12-bit resolution
+  
+  // Initialize pins
+  pinMode(STATIC_PRESSURE_PIN, INPUT);
+  pinMode(TOTAL_PRESSURE_PIN, INPUT);
+  for (int i = 0; i < NUM_DRAG_PORTS; i++) {
+    pinMode(PROFILE_DRAG_PINS[i], INPUT);
+  }
+  
+  // Initialize data structure
+  memset(&current_data, 0, sizeof(current_data));
+  current_data.atmospheric_pressure = atmospheric_pressure;
+  current_data.relative_humidity = relative_humidity;
+  
+  Serial.println("=== Fundamental Aerodynamic Measurements System ===");
+  Serial.println("Commands: MEASURE, START, STOP, CONFIG, CALIBRATE, EQUATIONS");
+  Serial.println("Raw measurements provided for manual calculation verification");
+  Serial.println("=====================================================");
+  
+  // Display sensor information
+  displaySensorInfo();
+}
+
+void loop() {
+  // Process serial commands
+  if (stringComplete) {
+    processCommand(inputString);
+    inputString = "";
+    stringComplete = false;
+  }
+  
+  // Continuous measurements if enabled
+  if (continuous_output) {
+    takeMeasurements();
+    calculateFundamentals();
+    outputMeasurements();
+    delay(output_interval);
+  } else {
+    delay(100);
+  }
+}
+
+void takeMeasurements() {
+  current_data.timestamp = millis();
+  
+  // Read pressure sensor voltages
+  current_data.static_voltage = readVoltage(STATIC_PRESSURE_PIN);
+  current_data.total_voltage = readVoltage(TOTAL_PRESSURE_PIN);
+  
+  for (int i = 0; i < NUM_DRAG_PORTS; i++) {
+    current_data.profile_voltages[i] = readVoltage(PROFILE_DRAG_PINS[i]);
+  }
+  
+  // Read temperature
+  tempSensor.requestTemperatures();
+  current_data.temperature_celsius = tempSensor.getTempCByIndex(0);
+  
+  // Convert voltages to pressures
+  current_data.static_pressure = voltageToPressure(current_data.static_voltage, static_sensor) + atmospheric_pressure;
+  current_data.total_pressure = voltageToPressure(current_data.total_voltage, total_sensor) + atmospheric_pressure;
+  
+  for (int i = 0; i < NUM_DRAG_PORTS; i++) {
+    current_data.profile_pressures[i] = voltageToPressure(current_data.profile_voltages[i], profile_sensor);
+  }
+}
+
+void calculateFundamentals() {
+  // Dynamic pressure: q = P_total - P_static
+  current_data.dynamic_pressure = current_data.total_pressure - current_data.static_pressure;
+  
+  // Temperature in Kelvin
+  current_data.temperature_kelvin = current_data.temperature_celsius + 273.15;
+  
+  // Air density using ideal gas law: ρ = P/(R*T)
+  // For dry air: R = 287.058 J/(kg·K)
+  float R_specific = 287.058; // J/(kg·K) for dry air
+  
+  // Correction for humidity (simplified)
+  float humidity_factor = 1.0 - (current_data.relative_humidity / 100.0) * 0.0037;
+  
+  current_data.air_density = (current_data.static_pressure * humidity_factor) / 
+                            (R_specific * current_data.temperature_kelvin);
+  
+  // Dynamic viscosity using Sutherland's formula
+  // μ = μ₀ * (T/T₀)^(3/2) * (T₀ + S)/(T + S)
+  float mu_0 = 1.716e-5;  // Reference viscosity at T₀ (Pa·s)
+  float T_0 = 273.15;     // Reference temperature (K)
+  float S = 110.4;        // Sutherland constant for air (K)
+  
+  current_data.air_viscosity = mu_0 * pow(current_data.temperature_kelvin / T_0, 1.5) * 
+                              (T_0 + S) / (current_data.temperature_kelvin + S);
+  
+  // Velocity from dynamic pressure: V = sqrt(2*q/ρ)
+  if (current_data.dynamic_pressure > 0) {
+    current_data.velocity = sqrt(2.0 * current_data.dynamic_pressure / current_data.air_density);
+  } else {
+    current_data.velocity = 0;
+  }
+  
+  // Reynolds number: Re = ρ*V*L/μ
+  current_data.reynolds_number = (current_data.air_density * current_data.velocity * 
+                                 characteristic_length) / current_data.air_viscosity;
+  
+  // Profile drag coefficient (simplified method using pressure ports)
+  // This is a basic integration - actual method depends on port placement
+  calculateProfileDrag();
+}
+
+void calculateProfileDrag() {
+  // Profile drag calculation using wake survey method (simplified)
+  // Cd_profile = (2/A) * ∫(ρ*u*(U-u))dy
+  // This is a simplified approximation using discrete pressure measurements
+  
+  if (current_data.dynamic_pressure <= 0) {
+    current_data.profile_drag_coefficient = 0;
+    return;
+  }
+  
+  float total_momentum_deficit = 0;
+  float free_stream_velocity = current_data.velocity;
+  
+  // Assume pressure ports are equally spaced across wake
+  for (int i = 0; i < NUM_DRAG_PORTS; i++) {
+    // Convert pressure to local velocity: u = sqrt(2*P_local/ρ)
+    float local_dynamic_pressure = current_data.profile_pressures[i];
+    float local_velocity = 0;
+    
+    if (local_dynamic_pressure > 0) {
+      local_velocity = sqrt(2.0 * local_dynamic_pressure / current_data.air_density);
+    }
+    
+    // Momentum deficit per unit area
+    float velocity_deficit = free_stream_velocity - local_velocity;
+    total_momentum_deficit += local_velocity * velocity_deficit;
+  }
+  
+  // Approximate integration (assumes uniform spacing)
+  float wake_width = characteristic_length; // Approximate wake width
+  float dy = wake_width / NUM_DRAG_PORTS;
+  
+  current_data.profile_drag_coefficient = (2.0 * current_data.air_density * total_momentum_deficit * dy) / 
+                                         (current_data.air_density * free_stream_velocity * free_stream_velocity * reference_area);
+}
+
+float readVoltage(int pin) {
+  int raw_value = analogRead(pin);
+  return (raw_value / 1023.0) * 5.0; // Convert to voltage
+}
+
+float voltageToPressure(float voltage, SensorCalibration cal) {
+  // Convert voltage to pressure based on calibration
+  // For differential sensors: P = (V - V_zero) * (P_range / V_range)
+  float voltage_range = cal.full_scale_voltage - cal.zero_voltage;
+  return (voltage - cal.zero_voltage) * (cal.pressure_range / voltage_range);
+}
+
+void processCommand(String command) {
+  command.toUpperCase();
+  command.trim();
+  
+  if (command == "MEASURE") {
+    takeMeasurements();
+    calculateFundamentals();
+    outputDetailedMeasurements();
+  }
+  else if (command == "START") {
+    continuous_output = true;
+    Serial.println("CONTINUOUS_MODE_STARTED");
+    outputCSVHeader();
+  }
+  else if (command == "STOP") {
+    continuous_output = false;
+    Serial.println("CONTINUOUS_MODE_STOPPED");
+  }
+  else if (command.startsWith("CONFIG")) {
+    handleConfigCommand(command);
+  }
+  else if (command == "CALIBRATE") {
+    performZeroCalibration();
+  }
+  else if (command == "EQUATIONS") {
+    displayEquations();
+  }
+  else if (command == "SENSORS") {
+    displaySensorInfo();
+  }
+  else {
+    Serial.println("UNKNOWN_COMMAND");
+    Serial.println("Available: MEASURE, START, STOP, CONFIG, CALIBRATE, EQUATIONS, SENSORS");
+  }
+}
+
+void handleConfigCommand(String command) {
+  // CONFIG:PARAMETER:VALUE format
+  int firstColon = command.indexOf(':');
+  int secondColon = command.indexOf(':', firstColon + 1);
+  
+  if (firstColon > 0 && secondColon > 0) {
+    String parameter = command.substring(firstColon + 1, secondColon);
+    String value = command.substring(secondColon + 1);
+    
+    if (parameter == "LENGTH") {
+      characteristic_length = value.toFloat();
+      Serial.println("Characteristic length: " + String(characteristic_length, 4) + " m");
+    }
+    else if (parameter == "AREA") {
+      reference_area = value.toFloat();
+      Serial.println("Reference area: " + String(reference_area, 6) + " m²");
+    }
+    else if (parameter == "PRESSURE") {
+      atmospheric_pressure = value.toFloat();
+      current_data.atmospheric_pressure = atmospheric_pressure;
+      Serial.println("Atmospheric pressure: " + String(atmospheric_pressure, 1) + " Pa");
+    }
+    else if (parameter == "HUMIDITY") {
+      relative_humidity = value.toFloat();
+      current_data.relative_humidity = relative_humidity;
+      Serial.println("Relative humidity: " + String(relative_humidity, 1) + " %");
+    }
+    else if (parameter == "INTERVAL") {
+      output_interval = value.toInt();
+      Serial.println("Output interval: " + String(output_interval) + " ms");
+    }
+  }
+}
+
+void performZeroCalibration() {
+  Serial.println("ZERO_CALIBRATION_START");
+  Serial.println("Ensure all pressure ports are at atmospheric conditions");
+  
+  // Take 50 samples for averaging
+  float static_sum = 0, total_sum = 0;
+  float profile_sums[NUM_DRAG_PORTS] = {0};
+  
+  for (int i = 0; i < 50; i++) {
+    static_sum += readVoltage(STATIC_PRESSURE_PIN);
+    total_sum += readVoltage(TOTAL_PRESSURE_PIN);
+    
+    for (int j = 0; j < NUM_DRAG_PORTS; j++) {
+      profile_sums[j] += readVoltage(PROFILE_DRAG_PINS[j]);
+    }
+    
+    delay(20);
+  }
+  
+  // Calculate new zero points
+  static_sensor.zero_voltage = static_sum / 50.0;
+  total_sensor.zero_voltage = total_sum / 50.0;
+  profile_sensor.zero_voltage = profile_sums[0] / 50.0; // Assume all profile sensors same
+  
+  Serial.println("CALIBRATION_COMPLETE");
+  Serial.println("Static zero: " + String(static_sensor.zero_voltage, 4) + " V");
+  Serial.println("Total zero: " + String(total_sensor.zero_voltage, 4) + " V");
+  Serial.println("Profile zero: " + String(profile_sensor.zero_voltage, 4) + " V");
+}
+
+void outputMeasurements() {
+  // CSV format for data logging
+  Serial.print(current_data.timestamp);
+  Serial.print(",");
+  Serial.print(current_data.static_pressure, 2);
+  Serial.print(",");
+  Serial.print(current_data.total_pressure, 2);
+  Serial.print(",");
+  Serial.print(current_data.dynamic_pressure, 2);
+  Serial.print(",");
+  Serial.print(current_data.temperature_celsius, 2);
+  Serial.print(",");
+  Serial.print(current_data.temperature_kelvin, 2);
+  Serial.print(",");
+  Serial.print(current_data.air_density, 6);
+  Serial.print(",");
+  Serial.print(current_data.air_viscosity, 8);
+  Serial.print(",");
+  Serial.print(current_data.velocity, 4);
+  Serial.print(",");
+  Serial.print(current_data.reynolds_number, 1);
+  Serial.print(",");
+  Serial.print(current_data.profile_drag_coefficient, 6);
+  
+  for (int i = 0; i < NUM_DRAG_PORTS; i++) {
+    Serial.print(",");
+    Serial.print(current_data.profile_pressures[i], 3);
+  }
+  
+  Serial.println();
+}
+
+void outputDetailedMeasurements() {
+  Serial.println("\n=== DETAILED MEASUREMENTS ===");
+  
+  // Raw sensor readings
+  Serial.println("RAW SENSOR READINGS:");
+  Serial.println("  Static pressure voltage: " + String(current_data.static_voltage, 4) + " V");
+  Serial.println("  Total pressure voltage:  " + String(current_data.total_voltage, 4) + " V");
+  Serial.println("  Temperature:            " + String(current_data.temperature_celsius, 2) + " °C");
+  
+  for (int i = 0; i < NUM_DRAG_PORTS; i++) {
+    Serial.println("  Profile port " + String(i+1) + " voltage: " + String(current_data.profile_voltages[i], 4) + " V");
+  }
+  
+  // Converted pressures
+  Serial.println("\nPRESSURE MEASUREMENTS:");
+  Serial.println("  Static pressure:   " + String(current_data.static_pressure, 2) + " Pa");
+  Serial.println("  Total pressure:    " + String(current_data.total_pressure, 2) + " Pa");
+  Serial.println("  Dynamic pressure:  " + String(current_data.dynamic_pressure, 2) + " Pa");
+  
+  // Fundamental properties
+  Serial.println("\nAIR PROPERTIES:");
+  Serial.println("  Temperature:       " + String(current_data.temperature_kelvin, 2) + " K");
+  Serial.println("  Density:           " + String(current_data.air_density, 6) + " kg/m³");
+  Serial.println("  Dynamic viscosity: " + String(current_data.air_viscosity, 8) + " Pa·s");
+  Serial.println("  Kinematic viscosity: " + String(current_data.air_viscosity/current_data.air_density, 8) + " m²/s");
+  
+  // Flow properties
+  Serial.println("\nFLOW PROPERTIES:");
+  Serial.println("  Velocity:          " + String(current_data.velocity, 4) + " m/s");
+  Serial.println("  Velocity:          " + String(current_data.velocity * 3.6, 4) + " km/h");
+  Serial.println("  Velocity:          " + String(current_data.velocity * 2.237, 4) + " mph");
+  Serial.println("  Reynolds number:   " + String(current_data.reynolds_number, 1));
+  
+  // Profile drag
+  Serial.println("\nPROFILE DRAG:");
+  Serial.println("  Profile drag coeff: " + String(current_data.profile_drag_coefficient, 6));
+  
+  for (int i = 0; i < NUM_DRAG_PORTS; i++) {
+    Serial.println("  Port " + String(i+1) + " pressure: " + String(current_data.profile_pressures[i], 3) + " Pa");
+  }
+  
+  Serial.println("===============================\n");
+}
+
+void outputCSVHeader() {
+  Serial.println("timestamp_ms,static_Pa,total_Pa,dynamic_Pa,temp_C,temp_K,density_kg_m3,viscosity_Pa_s,velocity_m_s,reynolds,cd_profile,p1_Pa,p2_Pa,p3_Pa,p4_Pa");
+}
+
+void displaySensorInfo() {
+  Serial.println("\n=== SENSOR CONFIGURATION ===");
+  Serial.println("Static Pressure Sensor:");
+  Serial.println("  Type: " + static_sensor.sensor_type);
+  Serial.println("  Range: ±" + String(static_sensor.pressure_range) + " Pa");
+  Serial.println("  Zero: " + String(static_sensor.zero_voltage, 3) + " V");
+  
+  Serial.println("Total Pressure Sensor:");
+  Serial.println("  Type: " + total_sensor.sensor_type);
+  Serial.println("  Range: ±" + String(total_sensor.pressure_range) + " Pa");
+  Serial.println("  Zero: " + String(total_sensor.zero_voltage, 3) + " V");
+  
+  Serial.println("Profile Drag Sensors:");
+  Serial.println("  Type: " + profile_sensor.sensor_type);
+  Serial.println("  Range: ±" + String(profile_sensor.pressure_range) + " Pa");
+  Serial.println("  Zero: " + String(profile_sensor.zero_voltage, 3) + " V");
+  
+  Serial.println("Configuration:");
+  Serial.println("  Characteristic length: " + String(characteristic_length, 4) + " m");
+  Serial.println("  Reference area: " + String(reference_area, 6) + " m²");
+  Serial.println("  Atmospheric pressure: " + String(atmospheric_pressure, 1) + " Pa");
+  Serial.println("  Relative humidity: " + String(relative_humidity, 1) + " %");
+  Serial.println("============================\n");
+}
+
+void displayEquations() {
+  Serial.println("\n=== FUNDAMENTAL EQUATIONS ===");
+  Serial.println("Dynamic Pressure:");
+  Serial.println("  q = P_total - P_static");
+  Serial.println("");
+  
+  Serial.println("Air Density (Ideal Gas Law):");
+  Serial.println("  ρ = P_static / (R_specific × T)");
+  Serial.println("  R_specific = 287.058 J/(kg·K) for dry air");
+  Serial.println("");
+  
+  Serial.println("Dynamic Viscosity (Sutherland's Law):");
+  Serial.println("  μ = μ₀ × (T/T₀)^1.5 × (T₀ + S)/(T + S)");
+  Serial.println("  μ₀ = 1.716×10⁻⁵ Pa·s, T₀ = 273.15 K, S = 110.4 K");
+  Serial.println("");
+  
+  Serial.println("Velocity from Dynamic Pressure:");
+  Serial.println("  V = √(2q/ρ)");
+  Serial.println("");
+  
+  Serial.println("Reynolds Number:");
+  Serial.println("  Re = ρVL/μ");
+  Serial.println("  where L = characteristic length");
+  Serial.println("");
+  
+  Serial.println("Profile Drag Coefficient:");
+  Serial.println("  Cd = (2/A) × ∫ρu(U-u)dy");
+  Serial.println("  Approximated using discrete pressure measurements");
+  Serial.println("=============================\n");
+}
+
+void serialEvent() {
+  while (Serial.available()) {
+    char inChar = (char)Serial.read();
+    
+    if (inChar == '\n') {
+      stringComplete = true;
+    } else {
+      inputString += inChar;
+    }
+  }
+}

@@ -1,0 +1,356 @@
+// Multi-Channel Pressure Measurement System for Aerodynamic Testing
+// Supports multiple pitot tubes and static ports for drag/lift measurements
+
+#include <Wire.h>
+
+// Pin definitions for analog pressure sensors
+const int STATIC_PRESSURE_PIN = A0;      // Static pressure (reference)
+const int DYNAMIC_PRESSURE_PIN = A1;     // Dynamic pressure (pitot tube)
+const int DRAG_PRESSURE_PINS[] = {A2, A3, A4, A5};  // Multiple drag measurement points
+const int NUM_DRAG_SENSORS = 4;
+
+// Digital pins for pressure sensor selection (if using multiplexer)
+const int MUX_S0 = 2;
+const int MUX_S1 = 3;
+const int MUX_S2 = 4;
+const int MUX_EN = 5;
+
+// Pressure sensor calibration constants
+struct PressureCalibration {
+  float offset_voltage;    // Zero pressure voltage
+  float sensitivity;       // Pa per Volt
+  float voltage_supply;    // Supply voltage
+};
+
+// Sensor calibrations (adjust based on your sensors)
+PressureCalibration static_cal = {2.5, 1000.0, 5.0};    // Example: ±2.5kPa sensor
+PressureCalibration dynamic_cal = {2.5, 1000.0, 5.0};   // Example: ±2.5kPa sensor
+PressureCalibration drag_cal = {2.5, 500.0, 5.0};       // Example: ±1.25kPa sensor
+
+// Data structures
+struct PressureData {
+  float static_pressure;     // Pa
+  float dynamic_pressure;    // Pa
+  float velocity;           // m/s (calculated from dynamic pressure)
+  float velocity_mph;       // mph
+  float drag_pressures[NUM_DRAG_SENSORS];  // Pa
+  float lift_coefficient;   // Calculated Cl
+  float drag_coefficient;   // Calculated Cd
+  float pressure_coefficient[NUM_DRAG_SENSORS]; // Cp values
+  unsigned long timestamp;
+};
+
+PressureData current_data;
+
+// System configuration
+bool system_enabled = false;
+float air_density = 1.225;  // kg/m³ at sea level, 15°C
+float reference_area = 0.01; // m² - model reference area (adjust for your model)
+float chord_length = 0.1;   // m - model chord length
+int sampling_rate = 100;    // Hz
+bool continuous_mode = false;
+
+// Communication
+String inputString = "";
+bool stringComplete = false;
+
+// Filtering
+const int FILTER_SIZE = 10;
+float pressure_filters[6][FILTER_SIZE];  // Circular buffers for filtering
+int filter_index = 0;
+
+void setup() {
+  Serial.begin(115200);
+  
+  // Initialize pins
+  for (int i = 0; i < NUM_DRAG_SENSORS; i++) {
+    pinMode(DRAG_PRESSURE_PINS[i], INPUT);
+  }
+  
+  // Initialize multiplexer pins (if used)
+  pinMode(MUX_S0, OUTPUT);
+  pinMode(MUX_S1, OUTPUT);
+  pinMode(MUX_S2, OUTPUT);
+  pinMode(MUX_EN, OUTPUT);
+  digitalWrite(MUX_EN, HIGH); // Disable initially
+  
+  // Initialize data structure
+  memset(&current_data, 0, sizeof(current_data));
+  
+  // Initialize filters
+  for (int i = 0; i < 6; i++) {
+    for (int j = 0; j < FILTER_SIZE; j++) {
+      pressure_filters[i][j] = 0.0;
+    }
+  }
+  
+  Serial.println("Multi-Channel Pressure Measurement System Ready");
+  Serial.println("Commands: START, STOP, SINGLE, CONFIG, CALIBRATE, STATUS, ZERO");
+  Serial.println("Data format: timestamp,static,dynamic,velocity_mph,drag1,drag2,drag3,drag4,Cl,Cd");
+}
+
+void loop() {
+  // Process serial commands
+  if (stringComplete) {
+    processCommand(inputString);
+    inputString = "";
+    stringComplete = false;
+  }
+  
+  // Take measurements
+  if (system_enabled) {
+    takeMeasurements();
+    calculateAerodynamics();
+    
+    if (continuous_mode) {
+      outputData();
+    }
+    
+    delay(1000 / sampling_rate);
+  } else {
+    delay(100);
+  }
+}
+
+void takeMeasurements() {
+  current_data.timestamp = millis();
+  
+  // Read static pressure
+  float static_voltage = readVoltage(STATIC_PRESSURE_PIN);
+  current_data.static_pressure = applyFilter(0, voltageToPressure(static_voltage, static_cal));
+  
+  // Read dynamic pressure (pitot tube)
+  float dynamic_voltage = readVoltage(DYNAMIC_PRESSURE_PIN);
+  current_data.dynamic_pressure = applyFilter(1, voltageToPressure(dynamic_voltage, dynamic_cal));
+  
+  // Calculate velocity from dynamic pressure
+  // q = 0.5 * ρ * V²  =>  V = sqrt(2*q/ρ)
+  if (current_data.dynamic_pressure > 0) {
+    current_data.velocity = sqrt(2.0 * current_data.dynamic_pressure / air_density);
+    current_data.velocity_mph = current_data.velocity * 2.237; // m/s to mph
+  } else {
+    current_data.velocity = 0;
+    current_data.velocity_mph = 0;
+  }
+  
+  // Read drag measurement pressures
+  for (int i = 0; i < NUM_DRAG_SENSORS; i++) {
+    float drag_voltage = readVoltage(DRAG_PRESSURE_PINS[i]);
+    current_data.drag_pressures[i] = applyFilter(i + 2, voltageToPressure(drag_voltage, drag_cal));
+  }
+}
+
+void calculateAerodynamics() {
+  float q_infinity = current_data.dynamic_pressure; // Free stream dynamic pressure
+  
+  if (q_infinity <= 0) {
+    // No flow, set everything to zero
+    current_data.lift_coefficient = 0;
+    current_data.drag_coefficient = 0;
+    for (int i = 0; i < NUM_DRAG_SENSORS; i++) {
+      current_data.pressure_coefficient[i] = 0;
+    }
+    return;
+  }
+  
+  // Calculate pressure coefficients: Cp = (P_local - P_static) / q_infinity
+  float total_cp_drag = 0;
+  float total_cp_lift = 0;
+  
+  for (int i = 0; i < NUM_DRAG_SENSORS; i++) {
+    current_data.pressure_coefficient[i] = 
+      (current_data.drag_pressures[i] - current_data.static_pressure) / q_infinity;
+    
+    // Accumulate for drag calculation (assuming sensors are positioned for drag measurement)
+    if (i < 2) { // Front sensors contribute to drag
+      total_cp_drag += current_data.pressure_coefficient[i];
+    } else { // Rear sensors contribute to lift
+      total_cp_lift += current_data.pressure_coefficient[i];
+    }
+  }
+  
+  // Simplified drag coefficient calculation
+  // This is a basic approximation - you'll need to adjust based on your specific setup
+  current_data.drag_coefficient = total_cp_drag / 2.0;
+  
+  // Simplified lift coefficient calculation
+  current_data.lift_coefficient = total_cp_lift / 2.0;
+}
+
+float readVoltage(int pin) {
+  int rawValue = analogRead(pin);
+  return (rawValue / 1023.0) * 5.0; // Convert to voltage
+}
+
+float voltageToPressure(float voltage, PressureCalibration cal) {
+  // Convert voltage to pressure based on calibration
+  return (voltage - cal.offset_voltage) * cal.sensitivity;
+}
+
+float applyFilter(int channel, float newValue) {
+  // Simple moving average filter
+  pressure_filters[channel][filter_index] = newValue;
+  
+  float sum = 0;
+  for (int i = 0; i < FILTER_SIZE; i++) {
+    sum += pressure_filters[channel][i];
+  }
+  
+  // Update filter index for next sample
+  if (channel == 5) { // Last channel
+    filter_index = (filter_index + 1) % FILTER_SIZE;
+  }
+  
+  return sum / FILTER_SIZE;
+}
+
+void processCommand(String command) {
+  command.toUpperCase();
+  command.trim();
+  
+  if (command == "START") {
+    system_enabled = true;
+    continuous_mode = true;
+    Serial.println("MEASUREMENT_STARTED");
+    Serial.println("timestamp,static_Pa,dynamic_Pa,velocity_mph,drag1_Pa,drag2_Pa,drag3_Pa,drag4_Pa,Cl,Cd");
+  }
+  else if (command == "STOP") {
+    system_enabled = false;
+    continuous_mode = false;
+    Serial.println("MEASUREMENT_STOPPED");
+  }
+  else if (command == "SINGLE") {
+    if (!system_enabled) system_enabled = true;
+    takeMeasurements();
+    calculateAerodynamics();
+    outputData();
+    if (!continuous_mode) system_enabled = false;
+  }
+  else if (command.startsWith("CONFIG")) {
+    handleConfigCommand(command);
+  }
+  else if (command == "CALIBRATE") {
+    performCalibration();
+  }
+  else if (command == "ZERO") {
+    zeroSensors();
+  }
+  else if (command == "STATUS") {
+    outputStatus();
+  }
+  else {
+    Serial.println("Unknown command");
+  }
+}
+
+void handleConfigCommand(String command) {
+  // CONFIG:DENSITY:1.225 or CONFIG:AREA:0.01 or CONFIG:RATE:50
+  int firstColon = command.indexOf(':');
+  int secondColon = command.indexOf(':', firstColon + 1);
+  
+  if (firstColon > 0 && secondColon > 0) {
+    String parameter = command.substring(firstColon + 1, secondColon);
+    String value = command.substring(secondColon + 1);
+    
+    if (parameter == "DENSITY") {
+      air_density = value.toFloat();
+      Serial.println("Air density set to: " + String(air_density) + " kg/m³");
+    }
+    else if (parameter == "AREA") {
+      reference_area = value.toFloat();
+      Serial.println("Reference area set to: " + String(reference_area) + " m²");
+    }
+    else if (parameter == "RATE") {
+      sampling_rate = value.toInt();
+      Serial.println("Sampling rate set to: " + String(sampling_rate) + " Hz");
+    }
+    else if (parameter == "CHORD") {
+      chord_length = value.toFloat();
+      Serial.println("Chord length set to: " + String(chord_length) + " m");
+    }
+  }
+}
+
+void performCalibration() {
+  Serial.println("CALIBRATION_START");
+  
+  // Take 100 samples for calibration
+  float static_sum = 0, dynamic_sum = 0;
+  float drag_sums[NUM_DRAG_SENSORS] = {0};
+  
+  for (int i = 0; i < 100; i++) {
+    static_sum += readVoltage(STATIC_PRESSURE_PIN);
+    dynamic_sum += readVoltage(DYNAMIC_PRESSURE_PIN);
+    
+    for (int j = 0; j < NUM_DRAG_SENSORS; j++) {
+      drag_sums[j] += readVoltage(DRAG_PRESSURE_PINS[j]);
+    }
+    
+    delay(10);
+  }
+  
+  // Calculate average zero-pressure voltages
+  static_cal.offset_voltage = static_sum / 100.0;
+  dynamic_cal.offset_voltage = dynamic_sum / 100.0;
+  
+  Serial.println("CALIBRATION_COMPLETE");
+  Serial.println("Static offset: " + String(static_cal.offset_voltage) + "V");
+  Serial.println("Dynamic offset: " + String(dynamic_cal.offset_voltage) + "V");
+}
+
+void zeroSensors() {
+  // Reset all filter buffers
+  for (int i = 0; i < 6; i++) {
+    for (int j = 0; j < FILTER_SIZE; j++) {
+      pressure_filters[i][j] = 0.0;
+    }
+  }
+  filter_index = 0;
+  Serial.println("SENSORS_ZEROED");
+}
+
+void outputData() {
+  // CSV format: timestamp,static,dynamic,velocity_mph,drag1,drag2,drag3,drag4,Cl,Cd
+  Serial.print(current_data.timestamp);
+  Serial.print(",");
+  Serial.print(current_data.static_pressure, 3);
+  Serial.print(",");
+  Serial.print(current_data.dynamic_pressure, 3);
+  Serial.print(",");
+  Serial.print(current_data.velocity_mph, 3);
+  
+  for (int i = 0; i < NUM_DRAG_SENSORS; i++) {
+    Serial.print(",");
+    Serial.print(current_data.drag_pressures[i], 3);
+  }
+  
+  Serial.print(",");
+  Serial.print(current_data.lift_coefficient, 6);
+  Serial.print(",");
+  Serial.println(current_data.drag_coefficient, 6);
+}
+
+void outputStatus() {
+  Serial.println("=== Pressure Measurement Status ===");
+  Serial.println("System: " + String(system_enabled ? "ENABLED" : "DISABLED"));
+  Serial.println("Mode: " + String(continuous_mode ? "CONTINUOUS" : "SINGLE"));
+  Serial.println("Sampling Rate: " + String(sampling_rate) + " Hz");
+  Serial.println("Air Density: " + String(air_density) + " kg/m³");
+  Serial.println("Reference Area: " + String(reference_area) + " m²");
+  Serial.println("Chord Length: " + String(chord_length) + " m");
+  Serial.println("Current Velocity: " + String(current_data.velocity_mph) + " mph");
+  Serial.println("Dynamic Pressure: " + String(current_data.dynamic_pressure) + " Pa");
+  Serial.println("===================================");
+}
+
+void serialEvent() {
+  while (Serial.available()) {
+    char inChar = (char)Serial.read();
+    
+    if (inChar == '\n') {
+      stringComplete = true;
+    } else {
+      inputString += inChar;
+    }
+  }
+}
